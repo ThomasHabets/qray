@@ -6,6 +6,7 @@ use std::f32::consts::PI;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 type Result<T> = std::result::Result<T, String>;
@@ -72,6 +73,23 @@ struct Config {
     #[arg(long, help = "Sample PNG textures referenced by the scene files")]
     textures: bool,
 
+    #[arg(long, help = "Enable adaptive antialiasing on high-contrast pixels")]
+    aa: bool,
+
+    #[arg(
+        long,
+        default_value_t = 4,
+        help = "Maximum extra AA rays per triggered pixel, from 1 to 16"
+    )]
+    aa_samples: usize,
+
+    #[arg(
+        long,
+        default_value_t = 0.12,
+        help = "Linear color contrast threshold that triggers adaptive AA"
+    )]
+    aa_threshold: f32,
+
     #[arg(long, help = "First frame number for directory input")]
     start: Option<u32>,
 
@@ -86,6 +104,15 @@ impl Config {
     fn validate(&self) -> Result<()> {
         if self.width == 0 || self.height == 0 {
             return Err("width and height must be non-zero".to_string());
+        }
+        if self.aa_samples == 0 || self.aa_samples > AA_OFFSETS.len() {
+            return Err(format!(
+                "aa-samples must be between 1 and {}",
+                AA_OFFSETS.len()
+            ));
+        }
+        if !self.aa_threshold.is_finite() || self.aa_threshold <= 0.0 {
+            return Err("aa-threshold must be a positive finite number".to_string());
         }
         Ok(())
     }
@@ -719,6 +746,10 @@ impl Camera {
     }
 
     fn ray_for_pixel(&self, x: usize, y: usize, width: usize, height: usize) -> Ray {
+        self.ray_for_sample(x as f32 + 0.5, y as f32 + 0.5, width, height)
+    }
+
+    fn ray_for_sample(&self, sample_x: f32, sample_y: f32, width: usize, height: usize) -> Ray {
         let (forward, right, up) = self.basis();
 
         let aspect = if self.right.length() > 1.0e-8 && self.up.length() > 1.0e-8 {
@@ -729,8 +760,8 @@ impl Camera {
         let angle = self.angle.clamp(1.0, 175.0) * PI / 180.0;
         let viewport_width = 2.0 * (angle * 0.5).tan();
         let viewport_height = viewport_width / aspect;
-        let px = ((x as f32 + 0.5) / width as f32 - 0.5) * viewport_width;
-        let py = (0.5 - (y as f32 + 0.5) / height as f32) * viewport_height;
+        let px = (sample_x / width as f32 - 0.5) * viewport_width;
+        let py = (0.5 - sample_y / height as f32) * viewport_height;
 
         Ray {
             origin: self.location,
@@ -1263,7 +1294,120 @@ fn render(scene: &Scene, config: &Config) -> Vec<Color> {
                 *pixel = trace(scene, ray, config);
             }
         });
+
+    if config.aa {
+        adaptive_antialias(scene, config, &pixels)
+    } else {
+        pixels
+    }
+}
+
+const AA_OFFSETS: [(f32, f32); 16] = [
+    (0.25, 0.25),
+    (0.75, 0.25),
+    (0.25, 0.75),
+    (0.75, 0.75),
+    (0.50, 0.125),
+    (0.875, 0.50),
+    (0.50, 0.875),
+    (0.125, 0.50),
+    (0.125, 0.125),
+    (0.875, 0.125),
+    (0.125, 0.875),
+    (0.875, 0.875),
+    (0.375, 0.375),
+    (0.625, 0.375),
+    (0.375, 0.625),
+    (0.625, 0.625),
+];
+
+fn adaptive_antialias(scene: &Scene, config: &Config, primary: &[Color]) -> Vec<Color> {
+    let mut pixels = primary.to_vec();
+    let aa_pixels = AtomicUsize::new(0);
+    let aa_rays = AtomicUsize::new(0);
+
     pixels
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(index, pixel)| {
+            let x = index % config.width;
+            let y = index / config.width;
+            if !should_antialias(
+                primary,
+                x,
+                y,
+                config.width,
+                config.height,
+                config.aa_threshold,
+            ) {
+                return;
+            }
+
+            *pixel = supersample_pixel(scene, config, x, y, primary[index]);
+            aa_pixels.fetch_add(1, AtomicOrdering::Relaxed);
+            aa_rays.fetch_add(config.aa_samples, AtomicOrdering::Relaxed);
+        });
+
+    if config.stats {
+        let aa_pixels = aa_pixels.load(AtomicOrdering::Relaxed);
+        let aa_rays = aa_rays.load(AtomicOrdering::Relaxed);
+        eprintln!(
+            "adaptive AA: {} / {} pixels, {} extra rays",
+            aa_pixels,
+            config.width * config.height,
+            aa_rays
+        );
+    }
+
+    pixels
+}
+
+fn should_antialias(
+    pixels: &[Color],
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    threshold: f32,
+) -> bool {
+    let center = pixels[y * width + x];
+    let min_x = x.saturating_sub(1);
+    let max_x = (x + 1).min(width - 1);
+    let min_y = y.saturating_sub(1);
+    let max_y = (y + 1).min(height - 1);
+
+    for yy in min_y..=max_y {
+        for xx in min_x..=max_x {
+            if xx == x && yy == y {
+                continue;
+            }
+            if color_contrast(center, pixels[yy * width + xx]) >= threshold {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn supersample_pixel(scene: &Scene, config: &Config, x: usize, y: usize, center: Color) -> Color {
+    let mut color = center;
+    for &(offset_x, offset_y) in AA_OFFSETS.iter().take(config.aa_samples) {
+        let ray = scene.camera.ray_for_sample(
+            x as f32 + offset_x,
+            y as f32 + offset_y,
+            config.width,
+            config.height,
+        );
+        color += trace(scene, ray, config);
+    }
+    color * (1.0 / (config.aa_samples as f32 + 1.0))
+}
+
+fn color_contrast(a: Color, b: Color) -> f32 {
+    (a.r - b.r)
+        .abs()
+        .max((a.g - b.g).abs())
+        .max((a.b - b.b).abs())
 }
 
 fn trace(scene: &Scene, ray: Ray, config: &Config) -> Color {
@@ -1376,12 +1520,15 @@ impl PngMetadata {
 impl Config {
     fn render_parameters(&self) -> String {
         format!(
-            "width={}, height={}, max_lights={}, shadows={}, textures={}, start={}, end={}, limit={}",
+            "width={}, height={}, max_lights={}, shadows={}, textures={}, aa={}, aa_samples={}, aa_threshold={}, start={}, end={}, limit={}",
             self.width,
             self.height,
             self.max_lights,
             self.shadows,
             self.textures,
+            self.aa,
+            self.aa_samples,
+            self.aa_threshold,
             option_u32(self.start),
             option_u32(self.end),
             option_usize(self.limit)
@@ -2292,6 +2439,16 @@ mod tests {
         assert!((pixels[0].r - 0.21586).abs() < 1.0e-4);
         assert!((pixels[0].g - 1.0).abs() < 1.0e-6);
         assert!((pixels[0].b - 0.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn adaptive_aa_triggers_only_on_contrast() {
+        let uniform = vec![Color::splat(0.25); 9];
+        assert!(!should_antialias(&uniform, 1, 1, 3, 3, 0.12));
+
+        let mut edge = uniform;
+        edge[1] = Color::splat(0.9);
+        assert!(should_antialias(&edge, 1, 1, 3, 3, 0.12));
     }
 
     #[test]
