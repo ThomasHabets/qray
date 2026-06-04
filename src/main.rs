@@ -1,6 +1,7 @@
+use clap::Parser;
+use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::f32::consts::PI;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -17,11 +18,8 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let config = Config::from_args(env::args().skip(1).collect())?;
-    if config.show_help {
-        print_usage();
-        return Ok(());
-    }
+    let config = Config::parse();
+    config.validate()?;
 
     let started = Instant::now();
     if config.input.is_dir() {
@@ -37,139 +35,62 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parser)]
+#[command(
+    name = "qray",
+    about = "Render qdqr POV frame files to binary PPM images"
+)]
 struct Config {
+    #[arg(
+        value_name = "FRAME_OR_DIR",
+        default_value = "qdqr-e1m1-20160502/frame-00000738.pov"
+    )]
     input: PathBuf,
+
+    #[arg(value_name = "OUTPUT")]
     output: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 320, help = "Output width in pixels")]
     width: usize,
+
+    #[arg(long, default_value_t = 180, help = "Output height in pixels")]
     height: usize,
+
+    #[arg(
+        long,
+        default_value_t = 8,
+        help = "Nearest lights to shade per surface hit"
+    )]
     max_lights: usize,
+
+    #[arg(
+        long = "no-shadows",
+        action = clap::ArgAction::SetFalse,
+        default_value_t = true,
+        help = "Skip shadow rays"
+    )]
     shadows: bool,
+
+    #[arg(long, help = "Print parse and render statistics")]
     stats: bool,
+
+    #[arg(long, help = "First frame number for directory input")]
     start: Option<u32>,
+
+    #[arg(long, help = "Last frame number for directory input")]
     end: Option<u32>,
+
+    #[arg(long, help = "Maximum number of directory frames to render")]
     limit: Option<usize>,
-    show_help: bool,
 }
 
 impl Config {
-    fn from_args(args: Vec<String>) -> Result<Self> {
-        let mut config = Self {
-            input: PathBuf::from("qdqr-e1m1-20160502/frame-00000738.pov"),
-            output: None,
-            width: 320,
-            height: 180,
-            max_lights: 8,
-            shadows: true,
-            stats: false,
-            start: None,
-            end: None,
-            limit: None,
-            show_help: false,
-        };
-
-        let mut positionals = Vec::new();
-        let mut i = 0;
-        while i < args.len() {
-            match args[i].as_str() {
-                "-h" | "--help" => {
-                    config.show_help = true;
-                    i += 1;
-                }
-                "--width" => {
-                    i += 1;
-                    config.width = parse_usize_arg(&args, i, "--width")?;
-                    i += 1;
-                }
-                "--height" => {
-                    i += 1;
-                    config.height = parse_usize_arg(&args, i, "--height")?;
-                    i += 1;
-                }
-                "--max-lights" => {
-                    i += 1;
-                    config.max_lights = parse_usize_arg(&args, i, "--max-lights")?;
-                    i += 1;
-                }
-                "--no-shadows" => {
-                    config.shadows = false;
-                    i += 1;
-                }
-                "--stats" => {
-                    config.stats = true;
-                    i += 1;
-                }
-                "--start" => {
-                    i += 1;
-                    config.start = Some(parse_u32_arg(&args, i, "--start")?);
-                    i += 1;
-                }
-                "--end" => {
-                    i += 1;
-                    config.end = Some(parse_u32_arg(&args, i, "--end")?);
-                    i += 1;
-                }
-                "--limit" => {
-                    i += 1;
-                    config.limit = Some(parse_usize_arg(&args, i, "--limit")?);
-                    i += 1;
-                }
-                other if other.starts_with('-') => {
-                    return Err(format!("unknown option `{other}`"));
-                }
-                _ => {
-                    positionals.push(PathBuf::from(&args[i]));
-                    i += 1;
-                }
-            }
-        }
-
-        if let Some(input) = positionals.first() {
-            config.input = input.clone();
-        }
-        if let Some(output) = positionals.get(1) {
-            config.output = Some(output.clone());
-        }
-        if positionals.len() > 2 {
-            return Err("too many positional arguments".to_string());
-        }
-
-        if config.width == 0 || config.height == 0 {
+    fn validate(&self) -> Result<()> {
+        if self.width == 0 || self.height == 0 {
             return Err("width and height must be non-zero".to_string());
         }
-
-        Ok(config)
+        Ok(())
     }
-}
-
-fn parse_usize_arg(args: &[String], index: usize, name: &str) -> Result<usize> {
-    args.get(index)
-        .ok_or_else(|| format!("missing value for {name}"))?
-        .parse()
-        .map_err(|_| format!("invalid value for {name}"))
-}
-
-fn parse_u32_arg(args: &[String], index: usize, name: &str) -> Result<u32> {
-    args.get(index)
-        .ok_or_else(|| format!("missing value for {name}"))?
-        .parse()
-        .map_err(|_| format!("invalid value for {name}"))
-}
-
-fn print_usage() {
-    eprintln!(
-        "usage: qray [options] [frame.pov|frame-dir] [output.ppm|output-dir]\n\
-\n\
-options:\n\
-  --width N        output width, default 320\n\
-  --height N       output height, default 180\n\
-  --max-lights N   nearest lights to shade per hit, default 8\n\
-  --no-shadows     skip shadow rays\n\
-  --start N        first frame number for directory input\n\
-  --end N          last frame number for directory input\n\
-  --limit N        maximum number of directory frames to render\n\
-  --stats          print parse/render statistics"
-    );
 }
 
 fn render_single_frame(config: &Config) -> Result<()> {
@@ -1059,14 +980,17 @@ impl BvhNode {
 
 fn render(scene: &Scene, config: &Config) -> Vec<Color> {
     let mut pixels = vec![Color::default(); config.width * config.height];
-    for y in 0..config.height {
-        for x in 0..config.width {
-            let ray = scene
-                .camera
-                .ray_for_pixel(x, y, config.width, config.height);
-            pixels[y * config.width + x] = trace(scene, ray, config);
-        }
-    }
+    pixels
+        .par_chunks_mut(config.width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for (x, pixel) in row.iter_mut().enumerate() {
+                let ray = scene
+                    .camera
+                    .ray_for_pixel(x, y, config.width, config.height);
+                *pixel = trace(scene, ray, config);
+            }
+        });
     pixels
 }
 
