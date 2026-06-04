@@ -623,23 +623,38 @@ fn decode_texture_pixels(color_type: png::ColorType, bytes: &[u8]) -> Result<Vec
     match color_type {
         png::ColorType::Rgb => Ok(bytes
             .chunks_exact(3)
-            .map(|pixel| rgb8(pixel[0], pixel[1], pixel[2]))
+            .map(|pixel| srgb8(pixel[0], pixel[1], pixel[2]))
             .collect()),
         png::ColorType::Rgba => Ok(bytes
             .chunks_exact(4)
-            .map(|pixel| rgb8(pixel[0], pixel[1], pixel[2]))
+            .map(|pixel| srgb8(pixel[0], pixel[1], pixel[2]))
             .collect()),
-        png::ColorType::Grayscale => Ok(bytes.iter().map(|&gray| rgb8(gray, gray, gray)).collect()),
+        png::ColorType::Grayscale => {
+            Ok(bytes.iter().map(|&gray| srgb8(gray, gray, gray)).collect())
+        }
         png::ColorType::GrayscaleAlpha => Ok(bytes
             .chunks_exact(2)
-            .map(|pixel| rgb8(pixel[0], pixel[0], pixel[0]))
+            .map(|pixel| srgb8(pixel[0], pixel[0], pixel[0]))
             .collect()),
         png::ColorType::Indexed => Err("indexed PNG was not expanded by the decoder".to_string()),
     }
 }
 
-fn rgb8(r: u8, g: u8, b: u8) -> Color {
-    Color::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+fn srgb8(r: u8, g: u8, b: u8) -> Color {
+    Color::new(
+        srgb_byte_to_linear(r),
+        srgb_byte_to_linear(g),
+        srgb_byte_to_linear(b),
+    )
+}
+
+fn srgb_byte_to_linear(value: u8) -> f32 {
+    let value = value as f32 / 255.0;
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 fn lerp_color(a: Color, b: Color, t: f32) -> Color {
@@ -2268,6 +2283,15 @@ mod tests {
         assert!(top.b < 0.01);
         assert!(bottom.r < 0.01);
         assert!(bottom.b > 0.99);
+    }
+
+    #[test]
+    fn texture_decoder_converts_srgb_to_linear() {
+        let pixels = decode_texture_pixels(png::ColorType::Rgb, &[128, 255, 0]).unwrap();
+        assert_eq!(pixels.len(), 1);
+        assert!((pixels[0].r - 0.21586).abs() < 1.0e-4);
+        assert!((pixels[0].g - 1.0).abs() < 1.0e-6);
+        assert!((pixels[0].b - 0.0).abs() < 1.0e-6);
     }
 
     #[test]
