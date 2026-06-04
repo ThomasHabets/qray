@@ -1,1 +1,10 @@
 /target
+*.ppm
+*.png
+*.swp
+hall-of-fame/
+renders/
+qray-flatshade
+qray-flatshade-png
+renders-flatshade
+qdqr-e1m1-20160502/

@@ -39,10 +39,7 @@ fn run() -> Result<()> {
 #[derive(Debug, Clone, Parser)]
 #[command(name = "qray", about = "Render qdqr POV frame files to PNG images")]
 struct Config {
-    #[arg(
-        value_name = "FRAME_OR_DIR",
-        default_value = "qdqr-e1m1-20160502/frame-00000738.pov"
-    )]
+    #[arg(value_name = "FILE_OR_DIR")]
     input: PathBuf,
 
     #[arg(value_name = "OUTPUT")]
@@ -1152,6 +1149,8 @@ fn write_png(
     let mut encoder = png::Encoder::new(writer, width as u32, height as u32);
     encoder.set_color(png::ColorType::Rgb);
     encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Best);
+    encoder.set_adaptive_filter(png::AdaptiveFilterType::Adaptive);
     add_png_text(
         &mut encoder,
         "Software",
