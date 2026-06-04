@@ -1195,7 +1195,7 @@ impl Aabb {
             }
             t_min = t_min.max(t0);
             t_max = t_max.min(t1);
-            if t_max <= t_min {
+            if t_max < t_min {
                 return false;
             }
         }
@@ -2474,6 +2474,20 @@ mod tests {
         assert!(forward.y > 0.99);
         assert!(right.x > 0.99);
         assert!(up.z > 0.99);
+    }
+
+    #[test]
+    fn aabb_accepts_boundary_touch_hits() {
+        let bbox = Aabb {
+            min: Vec3::new(1.0, 1.0, 1.0),
+            max: Vec3::new(2.0, 2.0, 2.0),
+        };
+        let ray = Ray {
+            origin: Vec3::new(0.0, 0.0, 2.0),
+            dir: Vec3::new(1.0, 1.0, -1.0).normalize_or(Vec3::default()),
+        };
+
+        assert!(bbox.hit(ray, f32::INFINITY));
     }
 
     #[test]
