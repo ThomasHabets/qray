@@ -4,11 +4,12 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::f32::consts::PI;
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 type Result<T> = std::result::Result<T, String>;
+const GIT_VERSION: &str = env!("GIT_VERSION");
 
 fn main() {
     if let Err(err) = run() {
@@ -36,10 +37,7 @@ fn run() -> Result<()> {
 }
 
 #[derive(Debug, Clone, Parser)]
-#[command(
-    name = "qray",
-    about = "Render qdqr POV frame files to binary PPM images"
-)]
+#[command(name = "qray", about = "Render qdqr POV frame files to PNG images")]
 struct Config {
     #[arg(
         value_name = "FRAME_OR_DIR",
@@ -100,7 +98,7 @@ fn render_single_frame(config: &Config) -> Result<()> {
             .file_stem()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("render"));
-        out.set_extension("ppm");
+        out.set_extension("png");
         out
     });
 
@@ -152,7 +150,7 @@ fn render_frame_directory(config: &Config) -> Result<()> {
                 .file_stem()
                 .ok_or_else(|| format!("invalid frame path `{}`", frame.display()))?,
         );
-        output.set_extension("ppm");
+        output.set_extension("png");
         render_frame(&mut library, &frame, &output, config)?;
     }
 
@@ -207,7 +205,8 @@ fn render_frame(
 
     let render_started = Instant::now();
     let pixels = render(&build.scene, config);
-    write_ppm(output, config.width, config.height, &pixels)?;
+    let metadata = PngMetadata::new(input, output, config);
+    write_png(output, config.width, config.height, &pixels, &metadata)?;
     if config.stats {
         eprintln!(
             "{} -> {} in {:.2}s",
@@ -1081,7 +1080,66 @@ fn background_color(dir: Vec3) -> Color {
     Color::new(0.02, 0.025, 0.035) * (1.0 - t) + Color::new(0.08, 0.11, 0.16) * t
 }
 
-fn write_ppm(path: &Path, width: usize, height: usize, pixels: &[Color]) -> Result<()> {
+#[derive(Debug)]
+struct PngMetadata {
+    input: String,
+    output: String,
+    render_parameters: String,
+    timestamp_unix: String,
+}
+
+impl PngMetadata {
+    fn new(input: &Path, output: &Path, config: &Config) -> Self {
+        Self {
+            input: input.display().to_string(),
+            output: output.display().to_string(),
+            render_parameters: config.render_parameters(),
+            timestamp_unix: render_timestamp_unix(),
+        }
+    }
+}
+
+impl Config {
+    fn render_parameters(&self) -> String {
+        format!(
+            "width={}, height={}, max_lights={}, shadows={}, start={}, end={}, limit={}",
+            self.width,
+            self.height,
+            self.max_lights,
+            self.shadows,
+            option_u32(self.start),
+            option_u32(self.end),
+            option_usize(self.limit)
+        )
+    }
+}
+
+fn option_u32(value: Option<u32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn option_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn render_timestamp_unix() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn write_png(
+    path: &Path,
+    width: usize,
+    height: usize,
+    pixels: &[Color],
+    metadata: &PngMetadata,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)
@@ -1090,23 +1148,59 @@ fn write_ppm(path: &Path, width: usize, height: usize, pixels: &[Color]) -> Resu
     }
     let file = File::create(path)
         .map_err(|err| format!("failed to create output `{}`: {err}", path.display()))?;
-    let mut writer = BufWriter::new(file);
-    writer
-        .write_all(format!("P6\n{width} {height}\n255\n").as_bytes())
-        .map_err(|err| format!("failed to write `{}`: {err}", path.display()))?;
-    for color in pixels {
-        writer
-            .write_all(&[
-                to_ppm_byte(color.r),
-                to_ppm_byte(color.g),
-                to_ppm_byte(color.b),
-            ])
-            .map_err(|err| format!("failed to write `{}`: {err}", path.display()))?;
+    let writer = BufWriter::new(file);
+    let mut encoder = png::Encoder::new(writer, width as u32, height as u32);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    add_png_text(
+        &mut encoder,
+        "Software",
+        &format!("qray {GIT_VERSION}"),
+        path,
+    )?;
+    add_png_text(&mut encoder, "qray.git_version", GIT_VERSION, path)?;
+    add_png_text(
+        &mut encoder,
+        "qray.render_timestamp_unix",
+        &metadata.timestamp_unix,
+        path,
+    )?;
+    add_png_text(&mut encoder, "qray.input", &metadata.input, path)?;
+    add_png_text(&mut encoder, "qray.output", &metadata.output, path)?;
+    add_png_text(
+        &mut encoder,
+        "qray.render_parameters",
+        &metadata.render_parameters,
+        path,
+    )?;
+
+    let mut bytes = Vec::with_capacity(width * height * 3);
+    for &color in pixels {
+        bytes.push(to_png_byte(color.r));
+        bytes.push(to_png_byte(color.g));
+        bytes.push(to_png_byte(color.b));
     }
+    let mut writer = encoder
+        .write_header()
+        .map_err(|err| format!("failed to write PNG header `{}`: {err}", path.display()))?;
+    writer
+        .write_image_data(&bytes)
+        .map_err(|err| format!("failed to write PNG data `{}`: {err}", path.display()))?;
     Ok(())
 }
 
-fn to_ppm_byte(value: f32) -> u8 {
+fn add_png_text<W: std::io::Write>(
+    encoder: &mut png::Encoder<W>,
+    key: &str,
+    value: &str,
+    path: &Path,
+) -> Result<()> {
+    encoder
+        .add_text_chunk(key.to_string(), value.to_string())
+        .map_err(|err| format!("failed to add PNG metadata `{}`: {err}", path.display()))
+}
+
+fn to_png_byte(value: f32) -> u8 {
     let gamma = value.clamp(0.0, 1.0).powf(1.0 / 2.2);
     (gamma * 255.0 + 0.5) as u8
 }
