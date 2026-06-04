@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::f32::consts::PI;
 use std::fs::{self, File};
-use std::io::BufWriter;
+use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -68,6 +68,9 @@ struct Config {
 
     #[arg(long, help = "Print parse and render statistics")]
     stats: bool,
+
+    #[arg(long, help = "Sample PNG textures referenced by the scene files")]
+    textures: bool,
 
     #[arg(long, help = "First frame number for directory input")]
     start: Option<u32>,
@@ -232,9 +235,10 @@ fn build_scene(library: &mut PovLibrary, input: &Path, config: &Config) -> Resul
 
     let mut triangles = Vec::new();
     let mut lights = Vec::new();
+    let mut texture_cache = config.textures.then(|| TextureCache::new(frame_dir));
     for call in &calls {
         if let Some(template) = library.macros.get(&call.name) {
-            template.instantiate(call, &mut triangles, &mut lights);
+            template.instantiate(call, &mut triangles, &mut lights, &mut texture_cache);
         } else {
             warnings.push(format!(
                 "macro `{}` is referenced but not loaded",
@@ -271,7 +275,13 @@ fn build_scene(library: &mut PovLibrary, input: &Path, config: &Config) -> Resul
         warnings.push("no scene lights found; inserted a camera light".to_string());
     }
 
-    let scene = Scene::new(camera, triangles, lights, config.stats);
+    let textures = texture_cache
+        .map(|cache| {
+            warnings.extend(cache.warnings);
+            cache.textures
+        })
+        .unwrap_or_default();
+    let scene = Scene::new(camera, triangles, lights, textures, config.stats);
     Ok(SceneBuild {
         scene,
         call_count: calls.len(),
@@ -368,9 +378,10 @@ impl MacroTemplate {
         call: &MacroCall,
         triangles: &mut Vec<Triangle>,
         lights: &mut Vec<Light>,
+        texture_cache: &mut Option<TextureCache>,
     ) {
         for mesh in &self.meshes {
-            mesh.instantiate(call, triangles);
+            mesh.instantiate(call, triangles, texture_cache);
         }
         for light in &self.lights {
             lights.push(Light {
@@ -387,12 +398,19 @@ impl MacroTemplate {
 #[derive(Clone, Debug)]
 struct MeshTemplate {
     vertices: Vec<Vec3>,
+    uvs: Vec<Vec2>,
     faces: Vec<FaceTemplate>,
+    uv_indices: Vec<[usize; 3]>,
     materials: Vec<MaterialTemplate>,
 }
 
 impl MeshTemplate {
-    fn instantiate(&self, call: &MacroCall, triangles: &mut Vec<Triangle>) {
+    fn instantiate(
+        &self,
+        call: &MacroCall,
+        triangles: &mut Vec<Triangle>,
+        texture_cache: &mut Option<TextureCache>,
+    ) {
         if self.vertices.is_empty() || self.faces.is_empty() {
             return;
         }
@@ -403,7 +421,19 @@ impl MeshTemplate {
             .map(|&vertex| transform_point(vertex, call.rot, call.pos))
             .collect();
 
-        for face in &self.faces {
+        let texture_indices: Vec<Option<usize>> = self
+            .materials
+            .iter()
+            .map(|material| {
+                texture_cache.as_mut().and_then(|cache| {
+                    material
+                        .texture_path(&call.texture_arg)
+                        .and_then(|path| cache.texture_index(path))
+                })
+            })
+            .collect();
+
+        for (face_index, face) in self.faces.iter().enumerate() {
             let Some(v0) = transformed.get(face.indices[0]).copied() else {
                 continue;
             };
@@ -418,7 +448,16 @@ impl MeshTemplate {
                 .get(face.material_index)
                 .map(|material| material.resolve(&call.texture_arg))
                 .unwrap_or_else(|| material_color_from_key(&call.name));
-            if let Some(triangle) = Triangle::new(v0, v1, v2, color) {
+            let uv = self
+                .uv_indices
+                .get(face_index)
+                .and_then(|indices| uv_triangle(&self.uvs, *indices));
+            let texture_index = texture_indices
+                .get(face.material_index)
+                .copied()
+                .flatten()
+                .filter(|_| uv.is_some());
+            if let Some(triangle) = Triangle::new(v0, v1, v2, color, texture_index, uv) {
                 triangles.push(triangle);
             }
         }
@@ -435,7 +474,14 @@ struct FaceTemplate {
 enum MaterialTemplate {
     Color(Color),
     Key(String),
+    Texture { key: String, source: TextureSource },
+}
+
+#[derive(Clone, Debug)]
+enum TextureSource {
+    TexturePrefixSuffix(String),
     Skin,
+    File(String),
 }
 
 impl MaterialTemplate {
@@ -443,9 +489,161 @@ impl MaterialTemplate {
         match self {
             Self::Color(color) => *color,
             Self::Key(key) => material_color_from_key(key),
-            Self::Skin => material_color_from_key(texture_arg),
+            Self::Texture { key, source } => match source {
+                TextureSource::Skin => material_color_from_key(texture_arg),
+                _ => material_color_from_key(key),
+            },
         }
     }
+
+    fn texture_path(&self, texture_arg: &str) -> Option<PathBuf> {
+        let Self::Texture { source, .. } = self else {
+            return None;
+        };
+        Some(match source {
+            TextureSource::TexturePrefixSuffix(suffix) => PathBuf::from(texture_arg)
+                .join(suffix.trim_start_matches('/').trim_start_matches('\\')),
+            TextureSource::Skin => PathBuf::from(texture_arg),
+            TextureSource::File(path) => PathBuf::from(path),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct TextureCache {
+    root: PathBuf,
+    paths: HashMap<PathBuf, usize>,
+    failed: HashSet<PathBuf>,
+    textures: Vec<Texture>,
+    warnings: Vec<String>,
+}
+
+impl TextureCache {
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            paths: HashMap::new(),
+            failed: HashSet::new(),
+            textures: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn texture_index(&mut self, path: PathBuf) -> Option<usize> {
+        let path = if path.is_absolute() {
+            path
+        } else {
+            self.root.join(path)
+        };
+        let key = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if let Some(&index) = self.paths.get(&key) {
+            return Some(index);
+        }
+        if self.failed.contains(&key) {
+            return None;
+        }
+
+        match Texture::load(&path) {
+            Ok(texture) => {
+                let index = self.textures.len();
+                self.textures.push(texture);
+                self.paths.insert(key, index);
+                Some(index)
+            }
+            Err(err) => {
+                self.failed.insert(key);
+                self.warnings.push(format!(
+                    "texture `{}` could not be loaded: {err}; using flat material color",
+                    path.display()
+                ));
+                None
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Texture {
+    width: usize,
+    height: usize,
+    pixels: Vec<Color>,
+}
+
+impl Texture {
+    fn load(path: &Path) -> Result<Self> {
+        let file = File::open(path).map_err(|err| err.to_string())?;
+        let mut decoder = png::Decoder::new(BufReader::new(file));
+        decoder.set_transformations(png::Transformations::normalize_to_color8());
+        let mut reader = decoder.read_info().map_err(|err| err.to_string())?;
+        let mut buffer = vec![0; reader.output_buffer_size()];
+        let info = reader
+            .next_frame(&mut buffer)
+            .map_err(|err| err.to_string())?;
+        let bytes = &buffer[..info.buffer_size()];
+        let pixels = decode_texture_pixels(info.color_type, bytes)?;
+
+        Ok(Self {
+            width: info.width as usize,
+            height: info.height as usize,
+            pixels,
+        })
+    }
+
+    fn sample(&self, uv: Vec2) -> Color {
+        if self.width == 0 || self.height == 0 || self.pixels.is_empty() {
+            return Color::splat(1.0);
+        }
+
+        let x = uv.x.rem_euclid(1.0) * self.width as f32 - 0.5;
+        let y = uv.y.rem_euclid(1.0) * self.height as f32 - 0.5;
+        let x0 = x.floor() as isize;
+        let y0 = y.floor() as isize;
+        let x1 = x0 + 1;
+        let y1 = y0 + 1;
+        let tx = x - x.floor();
+        let ty = y - y.floor();
+
+        let c00 = self.pixel_wrapped(x0, y0);
+        let c10 = self.pixel_wrapped(x1, y0);
+        let c01 = self.pixel_wrapped(x0, y1);
+        let c11 = self.pixel_wrapped(x1, y1);
+        let top = lerp_color(c00, c10, tx);
+        let bottom = lerp_color(c01, c11, tx);
+        lerp_color(top, bottom, ty)
+    }
+
+    fn pixel_wrapped(&self, x: isize, y: isize) -> Color {
+        let x = x.rem_euclid(self.width as isize) as usize;
+        let y = y.rem_euclid(self.height as isize) as usize;
+        self.pixels[y * self.width + x]
+    }
+}
+
+fn decode_texture_pixels(color_type: png::ColorType, bytes: &[u8]) -> Result<Vec<Color>> {
+    match color_type {
+        png::ColorType::Rgb => Ok(bytes
+            .chunks_exact(3)
+            .map(|pixel| rgb8(pixel[0], pixel[1], pixel[2]))
+            .collect()),
+        png::ColorType::Rgba => Ok(bytes
+            .chunks_exact(4)
+            .map(|pixel| rgb8(pixel[0], pixel[1], pixel[2]))
+            .collect()),
+        png::ColorType::Grayscale => Ok(bytes.iter().map(|&gray| rgb8(gray, gray, gray)).collect()),
+        png::ColorType::GrayscaleAlpha => Ok(bytes
+            .chunks_exact(2)
+            .map(|pixel| rgb8(pixel[0], pixel[0], pixel[0]))
+            .collect()),
+        png::ColorType::Indexed => Err("indexed PNG was not expanded by the decoder".to_string()),
+    }
+}
+
+fn rgb8(r: u8, g: u8, b: u8) -> Color {
+    Color::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+}
+
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    a * (1.0 - t) + b * t
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -523,6 +721,34 @@ impl Camera {
             origin: self.location,
             dir: (forward + right * px + up * py).normalize_or(forward),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Vec2 {
+    x: f32,
+    y: f32,
+}
+
+impl Vec2 {
+    const fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+}
+
+impl std::ops::Add for Vec2 {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self::new(self.x + rhs.x, self.y + rhs.y)
+    }
+}
+
+impl std::ops::Mul<f32> for Vec2 {
+    type Output = Self;
+
+    fn mul(self, rhs: f32) -> Self::Output {
+        Self::new(self.x * rhs, self.y * rhs)
     }
 }
 
@@ -712,11 +938,18 @@ struct Scene {
     camera: Camera,
     triangles: Vec<Triangle>,
     lights: Vec<Light>,
+    textures: Vec<Texture>,
     bvh: BvhNode,
 }
 
 impl Scene {
-    fn new(camera: Camera, triangles: Vec<Triangle>, lights: Vec<Light>, stats: bool) -> Self {
+    fn new(
+        camera: Camera,
+        triangles: Vec<Triangle>,
+        lights: Vec<Light>,
+        textures: Vec<Texture>,
+        stats: bool,
+    ) -> Self {
         let start = Instant::now();
         let mut indices: Vec<usize> = (0..triangles.len()).collect();
         let bvh = BvhNode::build(&mut indices, &triangles);
@@ -727,6 +960,7 @@ impl Scene {
             camera,
             triangles,
             lights,
+            textures,
             bvh,
         }
     }
@@ -758,12 +992,21 @@ struct Triangle {
     e2: Vec3,
     normal: Vec3,
     color: Color,
+    texture_index: Option<usize>,
+    uv: Option<[Vec2; 3]>,
     bbox: Aabb,
     centroid: Vec3,
 }
 
 impl Triangle {
-    fn new(v0: Vec3, v1: Vec3, v2: Vec3, color: Color) -> Option<Self> {
+    fn new(
+        v0: Vec3,
+        v1: Vec3,
+        v2: Vec3,
+        color: Color,
+        texture_index: Option<usize>,
+        uv: Option<[Vec2; 3]>,
+    ) -> Option<Self> {
         let e1 = v1 - v0;
         let e2 = v2 - v0;
         let normal = e1.cross(e2).normalize_or(Vec3::default());
@@ -782,6 +1025,8 @@ impl Triangle {
             e2,
             normal,
             color,
+            texture_index,
+            uv,
             bbox,
             centroid: (v0 + v1 + v2) / 3.0,
         })
@@ -810,6 +1055,22 @@ impl Triangle {
         } else {
             None
         }
+    }
+
+    fn color_at(&self, bary_u: f32, bary_v: f32, textures: &[Texture]) -> Color {
+        let Some(texture_index) = self.texture_index else {
+            return self.color;
+        };
+        let Some(uv) = self.uv else {
+            return self.color;
+        };
+        let Some(texture) = textures.get(texture_index) else {
+            return self.color;
+        };
+
+        let bary_w = 1.0 - bary_u - bary_v;
+        let uv = uv[0] * bary_w + uv[1] * bary_u + uv[2] * bary_v;
+        texture.sample(uv)
     }
 }
 
@@ -995,16 +1256,17 @@ fn trace(scene: &Scene, ray: Ray, config: &Config) -> Color {
         return background_color(ray.dir);
     };
 
-    let triangle = scene.triangles[hit.triangle_index];
+    let triangle = &scene.triangles[hit.triangle_index];
+    let base_color = triangle.color_at(hit.bary_u, hit.bary_v, &scene.textures);
     let point = ray.origin + ray.dir * hit.t;
     let mut normal = triangle.normal;
     if normal.dot(ray.dir) > 0.0 {
         normal = -normal;
     }
 
-    let mut color = triangle.color * 0.14;
-    color += triangle.color * (0.08 * normal.z.max(0.0));
-    color += triangle.color * (0.05 * (-ray.dir).dot(normal).max(0.0));
+    let mut color = base_color * 0.14;
+    color += base_color * (0.08 * normal.z.max(0.0));
+    color += base_color * (0.05 * (-ray.dir).dot(normal).max(0.0));
 
     for index in nearest_lights(point, &scene.lights, config.max_lights) {
         let light = scene.lights[index];
@@ -1031,7 +1293,7 @@ fn trace(scene: &Scene, ray: Ray, config: &Config) -> Color {
 
         let attenuation = light_attenuation(distance, light.fade_distance, light.fade_power);
         let strength = ndotl * light.intensity * attenuation;
-        color += triangle.color * light.color * strength;
+        color += base_color * light.color * strength;
     }
 
     color.tone_map().clamp01()
@@ -1099,11 +1361,12 @@ impl PngMetadata {
 impl Config {
     fn render_parameters(&self) -> String {
         format!(
-            "width={}, height={}, max_lights={}, shadows={}, start={}, end={}, limit={}",
+            "width={}, height={}, max_lights={}, shadows={}, textures={}, start={}, end={}, limit={}",
             self.width,
             self.height,
             self.max_lights,
             self.shadows,
+            self.textures,
             option_u32(self.start),
             option_u32(self.end),
             option_usize(self.limit)
@@ -1239,8 +1502,16 @@ fn parse_mesh_template(mesh: &str) -> Option<MeshTemplate> {
     let vertices_block = extract_named_braced(mesh, "vertex_vectors")?;
     let vertices = parse_vec3_list(&mesh[vertices_block.0 + 1..vertices_block.1]);
 
+    let uvs = extract_named_braced(mesh, "uv_vectors")
+        .map(|(open, close)| parse_vec2_list(&mesh[open + 1..close]))
+        .unwrap_or_default();
+
     let face_block = extract_named_braced(mesh, "face_indices")?;
     let faces = parse_face_indices(&mesh[face_block.0 + 1..face_block.1]);
+
+    let uv_indices = extract_named_braced(mesh, "uv_indices")
+        .map(|(open, close)| parse_index_triples(&mesh[open + 1..close]))
+        .unwrap_or_default();
 
     let materials = extract_named_braced(mesh, "texture_list")
         .map(|(open, close)| parse_texture_list(&mesh[open + 1..close]))
@@ -1248,7 +1519,9 @@ fn parse_mesh_template(mesh: &str) -> Option<MeshTemplate> {
 
     Some(MeshTemplate {
         vertices,
+        uvs,
         faces,
+        uv_indices,
         materials,
     })
 }
@@ -1518,23 +1791,47 @@ fn parse_texture_block(block: &str) -> MaterialTemplate {
     if let Some(color) = parse_pigment_color(block) {
         return MaterialTemplate::Color(color);
     }
+    let comment = parse_texture_comment(block);
     if block.contains("png skin") {
-        return MaterialTemplate::Skin;
+        return MaterialTemplate::Texture {
+            key: comment.unwrap_or_else(|| "skin".to_string()),
+            source: TextureSource::Skin,
+        };
     }
-
-    let comment = block.find("//").map(|comment_start| {
-        let rest = &block[comment_start + 2..];
-        rest.lines().next().unwrap_or("").trim().to_string()
-    });
-    if let Some(comment) = comment.filter(|comment| !comment.is_empty()) {
-        return MaterialTemplate::Key(comment);
+    if let Some(suffix) = parse_concat_texture_suffix(block) {
+        return MaterialTemplate::Texture {
+            key: comment.unwrap_or_else(|| suffix.clone()),
+            source: TextureSource::TexturePrefixSuffix(suffix),
+        };
     }
 
     if let Some(path) = find_first_quoted_after(block, "png") {
-        return MaterialTemplate::Key(path);
+        return MaterialTemplate::Texture {
+            key: comment.unwrap_or_else(|| path.clone()),
+            source: TextureSource::File(path),
+        };
+    }
+
+    if let Some(comment) = comment {
+        return MaterialTemplate::Key(comment);
     }
 
     MaterialTemplate::Key("default".to_string())
+}
+
+fn parse_texture_comment(block: &str) -> Option<String> {
+    block
+        .find("//")
+        .map(|comment_start| {
+            let rest = &block[comment_start + 2..];
+            rest.lines().next().unwrap_or("").trim().to_string()
+        })
+        .filter(|comment| !comment.is_empty())
+}
+
+fn parse_concat_texture_suffix(block: &str) -> Option<String> {
+    let concat = find_word(block, "concat", 0)?;
+    find_first_quoted_after(&block[concat..], "concat")
 }
 
 fn parse_pigment_color(block: &str) -> Option<Color> {
@@ -1669,6 +1966,22 @@ fn parse_vec3_list(text: &str) -> Vec<Vec3> {
     vectors
 }
 
+fn parse_vec2_list(text: &str) -> Vec<Vec2> {
+    let mut vectors = Vec::new();
+    let mut pos = 0;
+    while let Some(open_relative) = text[pos..].find('<') {
+        let open = pos + open_relative;
+        let Some(close) = text[open..].find('>').map(|index| open + index) else {
+            break;
+        };
+        if let Some(vector) = parse_angle_vec2(&text[open + 1..close]) {
+            vectors.push(vector);
+        }
+        pos = close + 1;
+    }
+    vectors
+}
+
 fn parse_face_indices(text: &str) -> Vec<FaceTemplate> {
     let mut faces = Vec::new();
     let mut pos = 0;
@@ -1691,6 +2004,34 @@ fn parse_face_indices(text: &str) -> Vec<FaceTemplate> {
         pos = close + 1;
     }
     faces
+}
+
+fn parse_index_triples(text: &str) -> Vec<[usize; 3]> {
+    let mut triples = Vec::new();
+    let mut pos = 0;
+    while let Some(open_relative) = text[pos..].find('<') {
+        let open = pos + open_relative;
+        let Some(close) = text[open..].find('>').map(|index| open + index) else {
+            break;
+        };
+        let indices: Vec<usize> = text[open + 1..close]
+            .split(',')
+            .filter_map(|part| part.trim().parse::<usize>().ok())
+            .collect();
+        if indices.len() >= 3 {
+            triples.push([indices[0], indices[1], indices[2]]);
+        }
+        pos = close + 1;
+    }
+    triples
+}
+
+fn uv_triangle(uvs: &[Vec2], indices: [usize; 3]) -> Option<[Vec2; 3]> {
+    Some([
+        *uvs.get(indices[0])?,
+        *uvs.get(indices[1])?,
+        *uvs.get(indices[2])?,
+    ])
 }
 
 fn parse_material_index_after(text: &str) -> Option<usize> {
@@ -1723,6 +2064,15 @@ fn parse_angle_vec3(text: &str) -> Option<Vec3> {
         None
     } else {
         Some(Vec3::new(values[0], values[1], values[2]))
+    }
+}
+
+fn parse_angle_vec2(text: &str) -> Option<Vec2> {
+    let values = parse_number_exprs(text);
+    if values.len() < 2 {
+        None
+    } else {
+        Some(Vec2::new(values[0], values[1]))
     }
 }
 
@@ -1866,6 +2216,61 @@ mod tests {
     }
 
     #[test]
+    fn parses_uv_vectors_and_indices() {
+        let uvs = parse_vec2_list("3, <0,0>,<1.5,-2>,<6/256,74/256>");
+        assert_eq!(uvs.len(), 3);
+        assert!((uvs[2].x - 6.0 / 256.0).abs() < 1.0e-6);
+        assert!((uvs[2].y - 74.0 / 256.0).abs() < 1.0e-6);
+
+        let indices = parse_index_triples("2, <0,1,2>,<2,1,0>");
+        assert_eq!(indices, vec![[0, 1, 2], [2, 1, 0]]);
+    }
+
+    #[test]
+    fn parses_texture_sources() {
+        let material = parse_texture_block(
+            r#"// tech04_3 (#6)
+            pigment {
+              image_map {
+                png concat(textureprefix, "/texture_6.png")
+              }
+            }"#,
+        );
+        assert_eq!(
+            material
+                .texture_path("maps/e1m1.bsp")
+                .unwrap()
+                .to_string_lossy(),
+            "maps/e1m1.bsp/texture_6.png"
+        );
+
+        let skin = parse_texture_block("pigment { image_map { png skin } }");
+        assert_eq!(
+            skin.texture_path("progs/soldier.mdl/skin_0.png")
+                .unwrap()
+                .to_string_lossy(),
+            "progs/soldier.mdl/skin_0.png"
+        );
+    }
+
+    #[test]
+    fn texture_sampler_uses_png_row_order_for_v() {
+        let texture = Texture {
+            width: 1,
+            height: 2,
+            pixels: vec![Color::new(1.0, 0.0, 0.0), Color::new(0.0, 0.0, 1.0)],
+        };
+
+        let top = texture.sample(Vec2::new(0.5, 0.25));
+        let bottom = texture.sample(Vec2::new(0.5, 0.75));
+
+        assert!(top.r > 0.99);
+        assert!(top.b < 0.01);
+        assert!(bottom.r < 0.01);
+        assert!(bottom.b > 0.99);
+    }
+
+    #[test]
     fn qdqr_camera_basis_is_perpendicular_after_look_at() {
         let camera = parse_camera(
             "camera {
@@ -1897,6 +2302,8 @@ mod tests {
             Vec3::new(1.0, 0.0, 0.0),
             Vec3::new(0.0, 1.0, 0.0),
             Color::splat(1.0),
+            None,
+            None,
         )
         .unwrap();
         let ray = Ray {
