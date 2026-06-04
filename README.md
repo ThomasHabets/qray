@@ -11,6 +11,10 @@ for this specific purpose.
 
 ## Turning the frames into video
 
+Example videos:
+* [With textures](https://youtu.be/XlcCi6l26wA)
+* [Flat shaded](https://youtu.be/5VEDoBVtqrs)
+
 ```
 ffmpeg -framerate 30 \
   -i 'renders/frame-%08d.png' \
