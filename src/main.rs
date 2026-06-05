@@ -6,7 +6,10 @@ use std::f32::consts::PI;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering as AtomicOrdering},
+};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 type Result<T> = std::result::Result<T, String>;
@@ -136,7 +139,9 @@ fn render_single_frame(config: &Config) -> Result<()> {
     });
 
     let mut library = PovLibrary::default();
-    render_frame(&mut library, &config.input, &output, config)
+    let frame_dir = config.input.parent().unwrap_or_else(|| Path::new(""));
+    let mut caches = FrameCaches::new(frame_dir, config.textures);
+    render_frame(&mut library, &mut caches, &config.input, &output, config)
 }
 
 fn render_frame_directory(config: &Config) -> Result<()> {
@@ -177,6 +182,7 @@ fn render_frame_directory(config: &Config) -> Result<()> {
     }
 
     let mut library = PovLibrary::default();
+    let mut caches = FrameCaches::new(&config.input, config.textures);
     for frame in frames {
         let mut output = output_dir.join(
             frame
@@ -184,7 +190,7 @@ fn render_frame_directory(config: &Config) -> Result<()> {
                 .ok_or_else(|| format!("invalid frame path `{}`", frame.display()))?,
         );
         output.set_extension("png");
-        render_frame(&mut library, &frame, &output, config)?;
+        render_frame(&mut library, &mut caches, &frame, &output, config)?;
     }
 
     Ok(())
@@ -210,22 +216,76 @@ fn frame_number(path: &Path) -> Option<u32> {
     stem.strip_prefix("frame-")?.parse().ok()
 }
 
+#[derive(Default)]
+struct FrameCaches {
+    texture_cache: Option<TextureCache>,
+    instances: HashMap<InstanceCacheKey, CachedInstance>,
+    macro_generation: u64,
+}
+
+impl FrameCaches {
+    fn new(texture_root: &Path, textures: bool) -> Self {
+        Self {
+            texture_cache: textures.then(|| TextureCache::new(texture_root)),
+            instances: HashMap::new(),
+            macro_generation: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CachedInstance {
+    triangles: Vec<Triangle>,
+    lights: Vec<Light>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct InstanceCacheKey {
+    name: String,
+    texture_arg: String,
+    pos: [u32; 3],
+    rot: [u32; 3],
+    textures: bool,
+    smooth_normals: bool,
+}
+
+impl InstanceCacheKey {
+    fn new(call: &MacroCall, textures: bool, smooth_normals: bool) -> Self {
+        Self {
+            name: call.name.clone(),
+            texture_arg: call.texture_arg.clone(),
+            pos: vec3_bits(call.pos),
+            rot: vec3_bits(call.rot),
+            textures,
+            smooth_normals: smooth_normals && call.is_mdl_object(),
+        }
+    }
+}
+
+fn vec3_bits(value: Vec3) -> [u32; 3] {
+    [value.x.to_bits(), value.y.to_bits(), value.z.to_bits()]
+}
+
 fn render_frame(
     library: &mut PovLibrary,
+    caches: &mut FrameCaches,
     input: &Path,
     output: &Path,
     config: &Config,
 ) -> Result<()> {
     let started = Instant::now();
-    let build = build_scene(library, input, config)?;
+    let build = build_scene(library, caches, input, config)?;
     if config.stats {
         eprintln!(
-            "{}: {} calls, {} triangles, {} lights, {} warnings, parse/build {:.2}s",
+            "{}: {} calls, {} triangles, {} lights, {} textures, {} warnings, instance cache {} hits / {} misses, parse/build {:.2}s",
             input.display(),
             build.call_count,
             build.scene.triangles.len(),
             build.scene.lights.len(),
+            build.texture_count,
             build.warnings.len(),
+            build.instance_cache_hits,
+            build.instance_cache_misses,
             started.elapsed().as_secs_f32()
         );
         for warning in build.warnings.iter().take(8) {
@@ -238,13 +298,18 @@ fn render_frame(
 
     let render_started = Instant::now();
     let pixels = render(&build.scene, config);
+    let render_elapsed = render_started.elapsed();
+    let png_started = Instant::now();
     let metadata = PngMetadata::new(input, output, config);
     write_png(output, config.width, config.height, &pixels, &metadata)?;
+    let png_elapsed = png_started.elapsed();
     if config.stats {
         eprintln!(
-            "{} -> {} in {:.2}s",
+            "{} -> {} render {:.2}s, png {:.2}s, total {:.2}s",
             input.display(),
             output.display(),
+            render_elapsed.as_secs_f32(),
+            png_elapsed.as_secs_f32(),
             render_started.elapsed().as_secs_f32()
         );
     }
@@ -252,7 +317,12 @@ fn render_frame(
     Ok(())
 }
 
-fn build_scene(library: &mut PovLibrary, input: &Path, config: &Config) -> Result<SceneBuild> {
+fn build_scene(
+    library: &mut PovLibrary,
+    caches: &mut FrameCaches,
+    input: &Path,
+    config: &Config,
+) -> Result<SceneBuild> {
     let text = fs::read_to_string(input)
         .map_err(|err| format!("failed to read frame `{}`: {err}", input.display()))?;
     let frame_dir = input
@@ -260,6 +330,10 @@ fn build_scene(library: &mut PovLibrary, input: &Path, config: &Config) -> Resul
         .ok_or_else(|| format!("frame `{}` has no parent directory", input.display()))?;
 
     let static_lights = library.load_includes(frame_dir, &text)?;
+    if caches.macro_generation != library.macro_generation {
+        caches.instances.clear();
+        caches.macro_generation = library.macro_generation;
+    }
 
     let mut warnings = std::mem::take(&mut library.warnings);
     let camera =
@@ -268,16 +342,35 @@ fn build_scene(library: &mut PovLibrary, input: &Path, config: &Config) -> Resul
 
     let mut triangles = Vec::new();
     let mut lights = Vec::new();
-    let mut texture_cache = config.textures.then(|| TextureCache::new(frame_dir));
+    let mut instance_cache_hits = 0usize;
+    let mut instance_cache_misses = 0usize;
     for call in &calls {
         if let Some(template) = library.macros.get(&call.name) {
+            let key = InstanceCacheKey::new(call, config.textures, config.smooth_normals);
+            if let Some(cached) = caches.instances.get(&key) {
+                triangles.extend_from_slice(&cached.triangles);
+                lights.extend_from_slice(&cached.lights);
+                instance_cache_hits += 1;
+                continue;
+            }
+
+            let triangle_start = triangles.len();
+            let light_start = lights.len();
             template.instantiate(
                 call,
                 &mut triangles,
                 &mut lights,
-                &mut texture_cache,
+                &mut caches.texture_cache,
                 config.smooth_normals,
             );
+            caches.instances.insert(
+                key,
+                CachedInstance {
+                    triangles: triangles[triangle_start..].to_vec(),
+                    lights: lights[light_start..].to_vec(),
+                },
+            );
+            instance_cache_misses += 1;
         } else {
             warnings.push(format!(
                 "macro `{}` is referenced but not loaded",
@@ -314,17 +407,21 @@ fn build_scene(library: &mut PovLibrary, input: &Path, config: &Config) -> Resul
         warnings.push("no scene lights found; inserted a camera light".to_string());
     }
 
-    let textures = texture_cache
-        .map(|cache| {
-            warnings.extend(cache.warnings);
-            cache.textures
-        })
-        .unwrap_or_default();
+    let textures = if let Some(cache) = caches.texture_cache.as_mut() {
+        warnings.append(&mut cache.warnings);
+        cache.textures.clone()
+    } else {
+        Vec::new()
+    };
+    let texture_count = textures.len();
     let scene = Scene::new(camera, triangles, lights, textures, config.stats);
     Ok(SceneBuild {
         scene,
         call_count: calls.len(),
         warnings,
+        instance_cache_hits,
+        instance_cache_misses,
+        texture_count,
     })
 }
 
@@ -332,6 +429,9 @@ struct SceneBuild {
     scene: Scene,
     call_count: usize,
     warnings: Vec<String>,
+    instance_cache_hits: usize,
+    instance_cache_misses: usize,
+    texture_count: usize,
 }
 
 #[derive(Default)]
@@ -340,6 +440,7 @@ struct PovLibrary {
     parsed_files: HashSet<PathBuf>,
     file_lights: HashMap<PathBuf, Vec<LightTemplate>>,
     warnings: Vec<String>,
+    macro_generation: u64,
 }
 
 impl PovLibrary {
@@ -390,6 +491,7 @@ impl PovLibrary {
         for (name, body) in parse_macros(&text) {
             let template = parse_macro_template(&name, &body);
             self.macros.insert(name, template);
+            self.macro_generation = self.macro_generation.wrapping_add(1);
         }
         self.file_lights
             .insert(key.clone(), parse_top_level_lights(&text));
@@ -611,7 +713,7 @@ struct TextureCache {
     root: PathBuf,
     paths: HashMap<PathBuf, usize>,
     failed: HashSet<PathBuf>,
-    textures: Vec<Texture>,
+    textures: Vec<Arc<Texture>>,
     warnings: Vec<String>,
 }
 
@@ -643,7 +745,7 @@ impl TextureCache {
         match Texture::load(&path) {
             Ok(texture) => {
                 let index = self.textures.len();
-                self.textures.push(texture);
+                self.textures.push(Arc::new(texture));
                 self.paths.insert(key, index);
                 Some(index)
             }
@@ -1054,7 +1156,7 @@ struct Scene {
     camera: Camera,
     triangles: Vec<Triangle>,
     lights: Vec<Light>,
-    textures: Vec<Texture>,
+    textures: Vec<Arc<Texture>>,
     bvh: BvhNode,
 }
 
@@ -1063,7 +1165,7 @@ impl Scene {
         camera: Camera,
         triangles: Vec<Triangle>,
         lights: Vec<Light>,
-        textures: Vec<Texture>,
+        textures: Vec<Arc<Texture>>,
         stats: bool,
     ) -> Self {
         let start = Instant::now();
@@ -1097,7 +1199,7 @@ impl Scene {
     }
 
     fn occluded(&self, ray: Ray, max_t: f32) -> bool {
-        self.hit(ray, max_t).is_some()
+        self.bvh.occluded(ray, &self.triangles, max_t)
     }
 }
 
@@ -1185,7 +1287,7 @@ impl Triangle {
         }
     }
 
-    fn color_at(&self, bary_u: f32, bary_v: f32, textures: &[Texture]) -> Color {
+    fn color_at(&self, bary_u: f32, bary_v: f32, textures: &[Arc<Texture>]) -> Color {
         let Some(texture_index) = self.texture_index else {
             return self.color;
         };
@@ -1261,7 +1363,12 @@ impl Aabb {
         }
     }
 
+    #[cfg(test)]
     fn hit(self, ray: Ray, max_t: f32) -> bool {
+        self.hit_distance(ray, max_t).is_some()
+    }
+
+    fn hit_distance(self, ray: Ray, max_t: f32) -> Option<f32> {
         let mut t_min: f32 = 0.0;
         let mut t_max: f32 = max_t;
 
@@ -1272,7 +1379,7 @@ impl Aabb {
             let max = self.max.component(axis);
             if dir.abs() < 1.0e-8 {
                 if origin < min || origin > max {
-                    return false;
+                    return None;
                 }
                 continue;
             }
@@ -1286,11 +1393,11 @@ impl Aabb {
             t_min = t_min.max(t0);
             t_max = t_max.min(t1);
             if t_max < t_min {
-                return false;
+                return None;
             }
         }
 
-        true
+        Some(t_min)
     }
 }
 
@@ -1343,14 +1450,17 @@ impl BvhNode {
     }
 
     fn hit(&self, ray: Ray, triangles: &[Triangle], best: &mut HitRecord) {
+        if self.bbox().hit_distance(ray, best.t).is_none() {
+            return;
+        }
+        self.hit_after_bbox(ray, triangles, best);
+    }
+
+    fn hit_after_bbox(&self, ray: Ray, triangles: &[Triangle], best: &mut HitRecord) {
         match self {
             Self::Leaf {
-                bbox,
-                triangles: leaf,
+                triangles: leaf, ..
             } => {
-                if !bbox.hit(ray, best.t) {
-                    return;
-                }
                 for &index in leaf {
                     if let Some((t, u, v)) = triangles[index].intersect(ray, best.t) {
                         best.t = t;
@@ -1360,13 +1470,67 @@ impl BvhNode {
                     }
                 }
             }
-            Self::Branch { bbox, left, right } => {
-                if !bbox.hit(ray, best.t) {
-                    return;
+            Self::Branch { left, right, .. } => {
+                let left_distance = left.bbox().hit_distance(ray, best.t);
+                let right_distance = right.bbox().hit_distance(ray, best.t);
+                match (left_distance, right_distance) {
+                    (Some(left_t), Some(right_t)) if right_t < left_t => {
+                        right.hit_after_bbox(ray, triangles, best);
+                        if left_t <= best.t {
+                            left.hit_after_bbox(ray, triangles, best);
+                        }
+                    }
+                    (Some(_), Some(right_t)) => {
+                        left.hit_after_bbox(ray, triangles, best);
+                        if right_t <= best.t {
+                            right.hit_after_bbox(ray, triangles, best);
+                        }
+                    }
+                    (Some(_), None) => left.hit_after_bbox(ray, triangles, best),
+                    (None, Some(_)) => right.hit_after_bbox(ray, triangles, best),
+                    (None, None) => {}
                 }
-                left.hit(ray, triangles, best);
-                right.hit(ray, triangles, best);
             }
+        }
+    }
+
+    fn occluded(&self, ray: Ray, triangles: &[Triangle], max_t: f32) -> bool {
+        if self.bbox().hit_distance(ray, max_t).is_none() {
+            return false;
+        }
+        self.occluded_after_bbox(ray, triangles, max_t)
+    }
+
+    fn occluded_after_bbox(&self, ray: Ray, triangles: &[Triangle], max_t: f32) -> bool {
+        match self {
+            Self::Leaf {
+                triangles: leaf, ..
+            } => leaf
+                .iter()
+                .any(|&index| triangles[index].intersect(ray, max_t).is_some()),
+            Self::Branch { left, right, .. } => {
+                let left_distance = left.bbox().hit_distance(ray, max_t);
+                let right_distance = right.bbox().hit_distance(ray, max_t);
+                match (left_distance, right_distance) {
+                    (Some(left_t), Some(right_t)) if right_t < left_t => {
+                        right.occluded_after_bbox(ray, triangles, max_t)
+                            || left.occluded_after_bbox(ray, triangles, max_t)
+                    }
+                    (Some(_), Some(_)) => {
+                        left.occluded_after_bbox(ray, triangles, max_t)
+                            || right.occluded_after_bbox(ray, triangles, max_t)
+                    }
+                    (Some(_), None) => left.occluded_after_bbox(ray, triangles, max_t),
+                    (None, Some(_)) => right.occluded_after_bbox(ray, triangles, max_t),
+                    (None, None) => false,
+                }
+            }
+        }
+    }
+
+    fn bbox(&self) -> Aabb {
+        match self {
+            Self::Leaf { bbox, .. } | Self::Branch { bbox, .. } => *bbox,
         }
     }
 }
@@ -1521,17 +1685,17 @@ fn trace(scene: &Scene, ray: Ray, config: &Config) -> Color {
     color += base_color * (0.08 * normal.z.max(0.0));
     color += base_color * (0.05 * (-ray.dir).dot(normal).max(0.0));
 
-    for index in nearest_lights(point, &scene.lights, config.max_lights) {
+    for_nearest_lights(point, &scene.lights, config.max_lights, |index| {
         let light = scene.lights[index];
         let to_light = light.position - point;
         let distance = to_light.length();
         if distance < 1.0e-4 {
-            continue;
+            return;
         }
         let light_dir = to_light / distance;
         let ndotl = normal.dot(light_dir).max(0.0);
         if ndotl <= 0.0 {
-            continue;
+            return;
         }
 
         if config.shadows {
@@ -1540,29 +1704,70 @@ fn trace(scene: &Scene, ray: Ray, config: &Config) -> Color {
                 dir: light_dir,
             };
             if scene.occluded(shadow_ray, distance - 0.06) {
-                continue;
+                return;
             }
         }
 
         let attenuation = light_attenuation(distance, light.fade_distance, light.fade_power);
         let strength = ndotl * light.intensity * attenuation;
         color += base_color * light.color * strength;
-    }
+    });
 
     color.tone_map().clamp01()
 }
 
-fn nearest_lights(point: Vec3, lights: &[Light], limit: usize) -> Vec<usize> {
+const STACK_LIGHT_LIMIT: usize = 32;
+
+fn for_nearest_lights<F>(point: Vec3, lights: &[Light], limit: usize, mut each: F)
+where
+    F: FnMut(usize),
+{
     if limit == 0 || lights.is_empty() {
-        return Vec::new();
+        return;
     }
     if lights.len() <= limit {
-        return (0..lights.len()).collect();
+        for index in 0..lights.len() {
+            each(index);
+        }
+        return;
+    }
+
+    if limit <= STACK_LIGHT_LIMIT {
+        let mut distances = [0.0; STACK_LIGHT_LIMIT];
+        let mut indices = [0usize; STACK_LIGHT_LIMIT];
+        let mut len = 0usize;
+
+        for (index, light) in lights.iter().enumerate() {
+            let delta = light.position - point;
+            let distance2 = delta.dot(delta);
+            if len < limit {
+                distances[len] = distance2;
+                indices[len] = index;
+                len += 1;
+                continue;
+            }
+            let mut farthest_slot = 0;
+            for slot in 1..len {
+                if distances[slot] > distances[farthest_slot] {
+                    farthest_slot = slot;
+                }
+            }
+            if distance2 < distances[farthest_slot] {
+                distances[farthest_slot] = distance2;
+                indices[farthest_slot] = index;
+            }
+        }
+
+        for &index in indices.iter().take(len) {
+            each(index);
+        }
+        return;
     }
 
     let mut nearest: Vec<(f32, usize)> = Vec::with_capacity(limit);
     for (index, light) in lights.iter().enumerate() {
-        let distance2 = (light.position - point).dot(light.position - point);
+        let delta = light.position - point;
+        let distance2 = delta.dot(delta);
         if nearest.len() < limit {
             nearest.push((distance2, index));
             continue;
@@ -1578,7 +1783,9 @@ fn nearest_lights(point: Vec3, lights: &[Light], limit: usize) -> Vec<usize> {
         }
     }
 
-    nearest.into_iter().map(|(_, index)| index).collect()
+    for (_, index) in nearest {
+        each(index);
+    }
 }
 
 fn light_attenuation(distance: f32, fade_distance: f32, fade_power: f32) -> f32 {
@@ -2583,6 +2790,64 @@ mod tests {
         };
 
         assert!(bbox.hit(ray, f32::INFINITY));
+    }
+
+    #[test]
+    fn scene_occlusion_stops_on_any_blocking_triangle() {
+        let triangle = Triangle::new(
+            Vec3::new(-1.0, -1.0, 0.0),
+            Vec3::new(1.0, -1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Color::splat(1.0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let scene = Scene::new(
+            Camera {
+                angle: 90.0,
+                location: Vec3::new(0.0, 0.0, 2.0),
+                look_at: Vec3::default(),
+                up: Vec3::new(0.0, 1.0, 0.0),
+                right: Vec3::new(1.0, 0.0, 0.0),
+                sky: Vec3::new(0.0, 1.0, 0.0),
+            },
+            vec![triangle],
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+        let ray = Ray {
+            origin: Vec3::new(0.0, 0.0, 1.0),
+            dir: Vec3::new(0.0, 0.0, -1.0),
+        };
+
+        assert!(scene.occluded(ray, f32::INFINITY));
+        assert!(!scene.occluded(ray, 0.5));
+    }
+
+    #[test]
+    fn nearest_light_iteration_preserves_replacement_slot_order() {
+        let lights: Vec<Light> = [5.0, 4.0, 3.0, 2.0, 1.0]
+            .into_iter()
+            .map(|x| Light {
+                position: Vec3::new(x, 0.0, 0.0),
+                color: Color::splat(1.0),
+                intensity: 1.0,
+                fade_distance: 1.0,
+                fade_power: 1.0,
+            })
+            .collect();
+        let point = Vec3::default();
+
+        let mut limited = Vec::new();
+        for_nearest_lights(point, &lights, 3, |index| limited.push(index));
+        assert_eq!(limited, vec![3, 4, 2]);
+
+        let mut unlimited = Vec::new();
+        for_nearest_lights(point, &lights, 10, |index| unlimited.push(index));
+        assert_eq!(unlimited, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
