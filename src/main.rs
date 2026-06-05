@@ -73,6 +73,12 @@ struct Config {
     #[arg(long, help = "Sample PNG textures referenced by the scene files")]
     textures: bool,
 
+    #[arg(
+        long,
+        help = "Smooth MDL object shading by averaging connected face normals"
+    )]
+    smooth_normals: bool,
+
     #[arg(long, help = "Enable adaptive antialiasing on high-contrast pixels")]
     aa: bool,
 
@@ -265,7 +271,13 @@ fn build_scene(library: &mut PovLibrary, input: &Path, config: &Config) -> Resul
     let mut texture_cache = config.textures.then(|| TextureCache::new(frame_dir));
     for call in &calls {
         if let Some(template) = library.macros.get(&call.name) {
-            template.instantiate(call, &mut triangles, &mut lights, &mut texture_cache);
+            template.instantiate(
+                call,
+                &mut triangles,
+                &mut lights,
+                &mut texture_cache,
+                config.smooth_normals,
+            );
         } else {
             warnings.push(format!(
                 "macro `{}` is referenced but not loaded",
@@ -393,6 +405,12 @@ struct MacroCall {
     texture_arg: String,
 }
 
+impl MacroCall {
+    fn is_mdl_object(&self) -> bool {
+        self.texture_arg.contains(".mdl") || self.name.contains("_mdl_")
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct MacroTemplate {
     meshes: Vec<MeshTemplate>,
@@ -406,9 +424,10 @@ impl MacroTemplate {
         triangles: &mut Vec<Triangle>,
         lights: &mut Vec<Light>,
         texture_cache: &mut Option<TextureCache>,
+        smooth_normals: bool,
     ) {
         for mesh in &self.meshes {
-            mesh.instantiate(call, triangles, texture_cache);
+            mesh.instantiate(call, triangles, texture_cache, smooth_normals);
         }
         for light in &self.lights {
             lights.push(Light {
@@ -437,6 +456,7 @@ impl MeshTemplate {
         call: &MacroCall,
         triangles: &mut Vec<Triangle>,
         texture_cache: &mut Option<TextureCache>,
+        smooth_normals: bool,
     ) {
         if self.vertices.is_empty() || self.faces.is_empty() {
             return;
@@ -447,6 +467,8 @@ impl MeshTemplate {
             .iter()
             .map(|&vertex| transform_point(vertex, call.rot, call.pos))
             .collect();
+        let vertex_normals = (smooth_normals && call.is_mdl_object())
+            .then(|| compute_vertex_normals(&transformed, &self.faces));
 
         let texture_indices: Vec<Option<usize>> = self
             .materials
@@ -484,11 +506,59 @@ impl MeshTemplate {
                 .copied()
                 .flatten()
                 .filter(|_| uv.is_some());
-            if let Some(triangle) = Triangle::new(v0, v1, v2, color, texture_index, uv) {
+            let normals = vertex_normals.as_ref().map(|vertex_normals| {
+                [
+                    vertex_normals
+                        .get(face.indices[0])
+                        .copied()
+                        .unwrap_or_default(),
+                    vertex_normals
+                        .get(face.indices[1])
+                        .copied()
+                        .unwrap_or_default(),
+                    vertex_normals
+                        .get(face.indices[2])
+                        .copied()
+                        .unwrap_or_default(),
+                ]
+            });
+            if let Some(triangle) = Triangle::new(v0, v1, v2, color, texture_index, uv, normals) {
                 triangles.push(triangle);
             }
         }
     }
+}
+
+fn compute_vertex_normals(vertices: &[Vec3], faces: &[FaceTemplate]) -> Vec<Vec3> {
+    let mut normals = vec![Vec3::default(); vertices.len()];
+
+    for face in faces {
+        let Some(v0) = vertices.get(face.indices[0]).copied() else {
+            continue;
+        };
+        let Some(v1) = vertices.get(face.indices[1]).copied() else {
+            continue;
+        };
+        let Some(v2) = vertices.get(face.indices[2]).copied() else {
+            continue;
+        };
+
+        let face_normal = (v1 - v0).cross(v2 - v0).normalize_or(Vec3::default());
+        if face_normal.length() < 1.0e-8 {
+            continue;
+        }
+
+        for &index in &face.indices {
+            if let Some(normal) = normals.get_mut(index) {
+                *normal += face_normal;
+            }
+        }
+    }
+
+    normals
+        .into_iter()
+        .map(|normal| normal.normalize_or(Vec3::default()))
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1037,6 +1107,7 @@ struct Triangle {
     e1: Vec3,
     e2: Vec3,
     normal: Vec3,
+    vertex_normals: [Vec3; 3],
     color: Color,
     texture_index: Option<usize>,
     uv: Option<[Vec2; 3]>,
@@ -1052,6 +1123,7 @@ impl Triangle {
         color: Color,
         texture_index: Option<usize>,
         uv: Option<[Vec2; 3]>,
+        vertex_normals: Option<[Vec3; 3]>,
     ) -> Option<Self> {
         let e1 = v1 - v0;
         let e2 = v2 - v0;
@@ -1059,6 +1131,15 @@ impl Triangle {
         if normal.length() < 1.0e-8 {
             return None;
         }
+        let vertex_normals = vertex_normals
+            .map(|normals| {
+                [
+                    normals[0].normalize_or(normal),
+                    normals[1].normalize_or(normal),
+                    normals[2].normalize_or(normal),
+                ]
+            })
+            .unwrap_or([normal; 3]);
         let mut bbox = Aabb::empty();
         bbox.grow(v0);
         bbox.grow(v1);
@@ -1070,6 +1151,7 @@ impl Triangle {
             e1,
             e2,
             normal,
+            vertex_normals,
             color,
             texture_index,
             uv,
@@ -1117,6 +1199,14 @@ impl Triangle {
         let bary_w = 1.0 - bary_u - bary_v;
         let uv = uv[0] * bary_w + uv[1] * bary_u + uv[2] * bary_v;
         texture.sample(uv)
+    }
+
+    fn normal_at(&self, bary_u: f32, bary_v: f32) -> Vec3 {
+        let bary_w = 1.0 - bary_u - bary_v;
+        (self.vertex_normals[0] * bary_w
+            + self.vertex_normals[1] * bary_u
+            + self.vertex_normals[2] * bary_v)
+            .normalize_or(self.normal)
     }
 }
 
@@ -1418,9 +1508,13 @@ fn trace(scene: &Scene, ray: Ray, config: &Config) -> Color {
     let triangle = &scene.triangles[hit.triangle_index];
     let base_color = triangle.color_at(hit.bary_u, hit.bary_v, &scene.textures);
     let point = ray.origin + ray.dir * hit.t;
-    let mut normal = triangle.normal;
+    let mut normal = triangle.normal_at(hit.bary_u, hit.bary_v);
     if normal.dot(ray.dir) > 0.0 {
         normal = -normal;
+    }
+    let mut bias_normal = triangle.normal;
+    if bias_normal.dot(ray.dir) > 0.0 {
+        bias_normal = -bias_normal;
     }
 
     let mut color = base_color * 0.14;
@@ -1442,7 +1536,7 @@ fn trace(scene: &Scene, ray: Ray, config: &Config) -> Color {
 
         if config.shadows {
             let shadow_ray = Ray {
-                origin: point + normal * 0.03,
+                origin: point + bias_normal * 0.03,
                 dir: light_dir,
             };
             if scene.occluded(shadow_ray, distance - 0.06) {
@@ -1520,12 +1614,13 @@ impl PngMetadata {
 impl Config {
     fn render_parameters(&self) -> String {
         format!(
-            "width={}, height={}, max_lights={}, shadows={}, textures={}, aa={}, aa_samples={}, aa_threshold={}, start={}, end={}, limit={}",
+            "width={}, height={}, max_lights={}, shadows={}, textures={}, smooth_normals={}, aa={}, aa_samples={}, aa_threshold={}, start={}, end={}, limit={}",
             self.width,
             self.height,
             self.max_lights,
             self.shadows,
             self.textures,
+            self.smooth_normals,
             self.aa,
             self.aa_samples,
             self.aa_threshold,
@@ -2491,12 +2586,96 @@ mod tests {
     }
 
     #[test]
+    fn vertex_normals_average_connected_face_normals() {
+        let vertices = vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        ];
+        let faces = vec![
+            FaceTemplate {
+                indices: [0, 1, 2],
+                material_index: 0,
+            },
+            FaceTemplate {
+                indices: [0, 3, 1],
+                material_index: 0,
+            },
+        ];
+
+        let normals = compute_vertex_normals(&vertices, &faces);
+
+        assert!(normals[0].x.abs() < 1.0e-6);
+        assert!((normals[0].y - 0.70710677).abs() < 1.0e-5);
+        assert!((normals[0].z - 0.70710677).abs() < 1.0e-5);
+        assert_eq!(normals[2].z, 1.0);
+    }
+
+    #[test]
+    fn smooth_normals_apply_only_to_mdl_calls_when_enabled() {
+        let mesh = MeshTemplate {
+            vertices: vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+            ],
+            uvs: Vec::new(),
+            faces: vec![
+                FaceTemplate {
+                    indices: [0, 1, 2],
+                    material_index: 0,
+                },
+                FaceTemplate {
+                    indices: [0, 3, 1],
+                    material_index: 0,
+                },
+            ],
+            uv_indices: Vec::new(),
+            materials: vec![MaterialTemplate::Color(Color::splat(1.0))],
+        };
+        let mdl_call = MacroCall {
+            name: "demprefix_progs_test_mdl_0".to_string(),
+            pos: Vec3::default(),
+            rot: Vec3::default(),
+            texture_arg: "progs/test.mdl/skin_0.png".to_string(),
+        };
+        let bsp_call = MacroCall {
+            name: "modelprefix_maps_test_bsp_0".to_string(),
+            pos: Vec3::default(),
+            rot: Vec3::default(),
+            texture_arg: "maps/test.bsp".to_string(),
+        };
+
+        let mut mdl_triangles = Vec::new();
+        let mut no_textures = None;
+        mesh.instantiate(&mdl_call, &mut mdl_triangles, &mut no_textures, true);
+
+        let mut bsp_triangles = Vec::new();
+        let mut no_textures = None;
+        mesh.instantiate(&bsp_call, &mut bsp_triangles, &mut no_textures, true);
+
+        let mut disabled_triangles = Vec::new();
+        let mut no_textures = None;
+        mesh.instantiate(&mdl_call, &mut disabled_triangles, &mut no_textures, false);
+
+        assert!((mdl_triangles[0].vertex_normals[0].y - 0.70710677).abs() < 1.0e-5);
+        assert!((mdl_triangles[0].vertex_normals[0].z - 0.70710677).abs() < 1.0e-5);
+        assert!(bsp_triangles[0].vertex_normals[0].y.abs() < 1.0e-6);
+        assert!((bsp_triangles[0].vertex_normals[0].z - 1.0).abs() < 1.0e-6);
+        assert!(disabled_triangles[0].vertex_normals[0].y.abs() < 1.0e-6);
+        assert!((disabled_triangles[0].vertex_normals[0].z - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
     fn intersects_triangle() {
         let tri = Triangle::new(
             Vec3::new(0.0, 0.0, 0.0),
             Vec3::new(1.0, 0.0, 0.0),
             Vec3::new(0.0, 1.0, 0.0),
             Color::splat(1.0),
+            None,
             None,
             None,
         )
