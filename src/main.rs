@@ -300,7 +300,8 @@ fn render_frame(
     let pixels = render(&build.scene, config);
     let render_elapsed = render_started.elapsed();
     let png_started = Instant::now();
-    let metadata = PngMetadata::new(input, output, config);
+    let ofilename = output.file_name().map(std::path::PathBuf::from);
+    let metadata = PngMetadata::new(input, &ofilename.unwrap_or("".into()), config);
     write_png(output, config.width, config.height, &pixels, &metadata)?;
     let png_elapsed = png_started.elapsed();
     if config.stats {
