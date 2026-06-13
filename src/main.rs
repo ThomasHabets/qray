@@ -16,6 +16,12 @@ type Result<T> = std::result::Result<T, String>;
 const GIT_VERSION: &str = env!("GIT_VERSION");
 
 fn main() {
+    println!(
+        "qray {} ({GIT_VERSION}) build with {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        env!("RUSTC_VERSION"),
+        env!("BUILD_PROFILE")
+    );
     if let Err(err) = run() {
         eprintln!("qray: {err}");
         std::process::exit(1);
@@ -1883,6 +1889,12 @@ fn write_png(
         &mut encoder,
         "Software",
         &format!("qray {GIT_VERSION}"),
+        path,
+    )?;
+    add_png_text(
+        &mut encoder,
+        "qray.cargo_pkg_version",
+        env!("CARGO_PKG_VERSION"),
         path,
     )?;
     add_png_text(&mut encoder, "qray.git_version", GIT_VERSION, path)?;
